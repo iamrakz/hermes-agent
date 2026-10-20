@@ -84,7 +84,12 @@ class HookRegistry:
         return list(self._loaded_hooks)
 
     def _register_builtin_hooks(self) -> None:
-        """Extension point for always-on built-in hooks; currently none shipped."""
+        """Register repository-owned gateway integrations before adapters connect."""
+        from gateway.rak_trading_os_authorized_commands import (
+            register_rak_trading_os_authorized_commands,
+        )
+
+        register_rak_trading_os_authorized_commands()
 
     def discover_and_load(self) -> None:
         """Register built-in hooks, then load every valid hook dir under the active profile's ``hooks/``."""
