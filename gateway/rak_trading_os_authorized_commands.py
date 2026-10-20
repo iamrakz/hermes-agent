@@ -57,17 +57,25 @@ class _RuntimeCommand:
     script: str
     intent: str
     target: str
+    accepted_returncodes: tuple[int, ...]
 
 
 _COMMANDS = {
-    "daily_guide": (f"{_SCRIPTS}/operator_hermes_daily_guide.py", "daily-guide"),
+    # Daily Guide uses 1 for valid inspection/refresh-required guidance.
+    "daily_guide": (
+        f"{_SCRIPTS}/operator_hermes_daily_guide.py",
+        "daily-guide",
+        (0, 1),
+    ),
     "daily_brief": (
         f"{_SCRIPTS}/operator_hermes_daily_read_surface.py",
         "daily-brief",
+        (0,),
     ),
     "attention": (
         f"{_SCRIPTS}/operator_hermes_daily_read_surface.py",
         "attention",
+        (0,),
     ),
 }
 
@@ -116,8 +124,8 @@ def _parse_request(request: AuthorizedCommandRequest) -> _RuntimeCommand | None:
                 return None
         except ValueError:
             return None
-    script, intent = _COMMANDS[command]
-    return _RuntimeCommand(script, intent, target)
+    script, intent, accepted_returncodes = _COMMANDS[command]
+    return _RuntimeCommand(script, intent, target, accepted_returncodes)
 
 
 def _bangkok_now_iso() -> str:
@@ -178,7 +186,7 @@ async def handle_rak_trading_os_authorized_command(
             await asyncio.wait_for(process.wait(), timeout=_REAP_TIMEOUT_SECONDS)
         return _fail(_RUNTIME_FAILED, "runtime_failed")
 
-    if process.returncode != 0:
+    if process.returncode not in command.accepted_returncodes:
         return _fail(_RUNTIME_FAILED, "runtime_failed")
     if len(stdout) > _MAX_STDOUT_BYTES:
         return _fail(_RUNTIME_OUTPUT_TOO_LARGE, "runtime_output_too_large")

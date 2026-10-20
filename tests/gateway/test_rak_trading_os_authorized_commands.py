@@ -348,3 +348,77 @@ async def test_oversized_stdout_fails_closed_without_partial_report(monkeypatch)
     assert result.failure_category == "runtime_output_too_large"
     assert "x" * 100 not in (result.response or "")
     assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "returncode", "handled"),
+    [
+        ("daily_guide", 0, True),
+        ("daily_guide", 1, True),
+        ("daily_guide", 2, False),
+        ("daily_guide", 4, False),
+        ("daily_brief", 0, True),
+        ("daily_brief", 1, False),
+        ("attention", 0, True),
+        ("attention", 1, False),
+    ],
+)
+async def test_fixed_command_exit_contract(
+    monkeypatch, caplog, command, returncode, handled
+):
+    stdout = (
+        b"DAILY GUIDE\nStatus: INSPECTION REQUIRED\n"
+        b"Read-only and non-authorizing.\nLive trading permission: NOT_PROVIDED\n"
+    )
+    sentinel = "PRIVATE-exit-contract-stderr"
+    create = AsyncMock(return_value=_Process(stdout, sentinel.encode(), returncode))
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", create)
+
+    result = await adapter.handle_rak_trading_os_authorized_command(
+        _request(f"/{command} today")
+    )
+
+    if handled:
+        assert result.disposition is AuthorizedCommandDisposition.CLAIMED_HANDLED
+        assert result.response == stdout.decode()
+        assert result.failure_category is None
+    else:
+        assert result.disposition is AuthorizedCommandDisposition.CLAIMED_FAILED
+        assert result.failure_category == "runtime_failed"
+        assert result.response == "Trading OS could not complete this request."
+    assert sentinel not in (result.response or "")
+    assert sentinel not in caplog.text
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdout", "category"),
+    [
+        (b"", "runtime_failed"),
+        (b"\xff", "runtime_failed"),
+        (b"x" * (adapter._MAX_STDOUT_BYTES + 1), "runtime_output_too_large"),
+        (
+            "ก".encode() * (adapter._MAX_RESPONSE_CHARS + 1),
+            "runtime_output_too_large",
+        ),
+    ],
+    ids=["empty", "invalid-utf8", "byte-limit", "character-limit"],
+)
+async def test_daily_guide_exit_one_still_validates_output(
+    monkeypatch, caplog, stdout, category
+):
+    sentinel = "PRIVATE-invalid-guide-stderr"
+    create = AsyncMock(return_value=_Process(stdout, sentinel.encode(), 1))
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", create)
+
+    result = await adapter.handle_rak_trading_os_authorized_command(
+        _request("/daily_guide today")
+    )
+
+    assert result.disposition is AuthorizedCommandDisposition.CLAIMED_FAILED
+    assert result.failure_category == category
+    assert sentinel not in (result.response or "")
+    assert sentinel not in caplog.text
+    assert create.await_count == 1
