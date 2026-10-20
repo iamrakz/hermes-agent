@@ -8,7 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import asyncio
 import concurrent.futures
 import dataclasses
@@ -21,6 +21,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agent.i18n import t
+from gateway import authorized_command_ingress as _r2_authority, authorized_command_ingress_routing as _r2_ingress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -35,7 +36,6 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -202,16 +202,11 @@ class GatewayInboundMixin:
         if notifier.first_time(platform_name, source.user_id) and getattr(self, "config", None) is not None:
             await notifier.notify(self, source, hint)
 
-    async def _hm_admit_event(
-        self, event: "MessageEvent"
-    ) -> Optional[Tuple["MessageEvent", SessionSource, bool]]:
-        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
-        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+    async def _hm_admit_event(self, event: "MessageEvent") -> Optional[Tuple["MessageEvent", SessionSource, bool, Any]]:
+        """Apply ingress gates and return the possibly rewritten admitted event."""
         from gateway.run import _is_slack_ignored_channel
         source = event.source
-        # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
-
         # 🔴 Cross-session leak guard: this per-message task was create_task()'d with a copy of the
         # spawning context, which may carry ANOTHER message's HERMES_SESSION_* ContextVars; until
         # _set_session_env binds ours a subprocess would read the foreign identity. Reset to _UNSET.
@@ -220,7 +215,6 @@ class GatewayInboundMixin:
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
-
         # Identity FIRST. Most adapters canonicalize at their own ingress; internal/voice paths
         # construct SessionSource directly, so this is the shared fail-closed gate. Strict boolean
         # marker: require the literal True so duck-typed test/internal sources with dynamic
@@ -233,9 +227,7 @@ class GatewayInboundMixin:
                 "targets an unserved profile"
             )
             return None
-
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
-
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
         _chat_id = getattr(source, "chat_id", None)
@@ -262,13 +254,16 @@ class GatewayInboundMixin:
             return None
 
         if is_internal:
-            return event, source, True
-
-        # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
-        # counting internal/system events would keep a genuinely idle gateway awake.
+            return event, source, True, None
         self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
+        _transport_event = event
+        _transport_state = event._inbound_event_state_snapshot()
+        event = await self._hm_pre_gateway_dispatch_hook(_transport_event, source)
         if event is None:
+            return None
+        event._inherit_inbound_event_state_from(_transport_event)
+        if not event._inbound_event_state_matches(_transport_state):
+            logger.warning("Dropping inbound message after plugin mutated process-local event state")
             return None
         source = event.source
 
@@ -296,7 +291,9 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
-        return event, source, False
+        _admission = object.__new__(_r2_authority._SuccessfulInboundAdmission)
+        object.__setattr__(_admission, "_SuccessfulInboundAdmission__event", event)
+        return event, source, False, _admission
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
@@ -1327,7 +1324,10 @@ class GatewayInboundMixin:
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
-        event, source, is_internal = _admitted
+        event, source, is_internal, _admission = _admitted
+        _authorized_context = None if is_internal else _r2_authority._context_from_successful_admission(_admission)
+        _ingress_result = (_r2_ingress.contain_internal_authorized_command(self, event) if is_internal else await _r2_ingress.route_cold_authorized_command(self, _authorized_context))
+        if _ingress_result.claimed: return _ingress_result.response
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
