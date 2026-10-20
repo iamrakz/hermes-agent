@@ -41,6 +41,49 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+@dataclass(eq=False, slots=True)
+class _InboundEventState:
+    """Shared process-local state retained by copies and merged event constituents."""
+
+    _parent: Optional["_InboundEventState"] = field(default=None, init=False, repr=False)
+    transport_evidence: tuple[Any, ...] = ()
+    transport_constituent_count: int = 1
+    command_started: bool = False
+    command_result: Any = None
+    command_future: Any = field(default=None, repr=False)
+    response_delivery_started: bool = False
+
+    def root(self) -> "_InboundEventState":
+        state = self
+        while state._parent is not None:
+            state = state._parent
+        cursor = self
+        while cursor._parent is not None and cursor._parent is not state:
+            parent = cursor._parent
+            cursor._parent = state
+            cursor = parent
+        return state
+
+    def absorb(self, other: "_InboundEventState") -> None:
+        left, right = self.root(), other.root()
+        if left is right:
+            return
+        if left.command_started or right.command_started:
+            raise ValueError("cannot merge independently executing inbound events")
+        right._parent = left
+        left.transport_evidence += tuple(
+            item for item in right.transport_evidence
+            if all(item is not existing for existing in left.transport_evidence)
+        )
+        left.transport_constituent_count += right.transport_constituent_count
+        left.command_started = left.command_started or right.command_started
+        if left.command_result is None:
+            left.command_result = right.command_result
+        if left.command_future is None:
+            left.command_future = right.command_future
+        left.response_delivery_started |= right.response_delivery_started
+
+
 @dataclass
 class MessageEvent:
     """Incoming message from a platform — the normalized shape all adapters produce."""
@@ -104,13 +147,114 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Process-local state is an ordinary dataclass field so ``dataclasses.replace`` retains the
+    # same identity. It is neither serialized nor an authorization capability.
+    _inbound_event_state: _InboundEventState = field(
+        default_factory=_InboundEventState, repr=False, compare=False
+    )
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        """Absorb reply intent and process-local identity from a merged constituent."""
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
+        self._inbound_event_state.absorb(other._inbound_event_state)
+
+    def _inherit_inbound_event_state_from(self, original: "MessageEvent") -> None:
+        """Carry transport identity through a hook replacement that did not copy the event."""
+        self._inbound_event_state = original._inbound_event_state
+
+    def _inbound_event_state_snapshot(self) -> tuple[Any, ...]:
+        """Opaque hook-boundary checkpoint; state is not a plugin authority surface."""
+        state = self._inbound_event_state.root()
+        return (
+            state,
+            state.transport_evidence,
+            state.transport_constituent_count,
+            state.command_started,
+            state.command_result,
+            state.command_future,
+            state.response_delivery_started,
+        )
+
+    def _inbound_event_state_matches(self, snapshot: tuple[Any, ...]) -> bool:
+        state = self._inbound_event_state.root()
+        return (
+            len(snapshot) == 7
+            and state is snapshot[0]
+            and len(state.transport_evidence) == len(snapshot[1])
+            and all(
+                current is previous
+                for current, previous in zip(state.transport_evidence, snapshot[1])
+            )
+            and state.transport_constituent_count == snapshot[2]
+            and state.command_started is snapshot[3]
+            and state.command_result is snapshot[4]
+            and state.command_future is snapshot[5]
+            and state.response_delivery_started is snapshot[6]
+        )
+
+    @property
+    def _inbound_transport_evidence(self) -> Any:
+        evidence = self._inbound_event_state.root().transport_evidence
+        return evidence[0] if evidence else None
+
+    @_inbound_transport_evidence.setter
+    def _inbound_transport_evidence(self, evidence: Any) -> None:
+        state = self._inbound_event_state.root()
+        if evidence is None:
+            return
+        if state.transport_evidence and all(
+            evidence is not existing for existing in state.transport_evidence
+        ):
+            raise ValueError("inbound transport evidence is immutable once captured")
+        if not state.transport_evidence:
+            state.transport_evidence = (evidence,)
+
+    @property
+    def _inbound_transport_evidences(self) -> tuple[Any, ...]:
+        return self._inbound_event_state.root().transport_evidence
+
+    @property
+    def _inbound_transport_constituent_count(self) -> int:
+        return self._inbound_event_state.root().transport_constituent_count
+
+    @property
+    def _authorized_command_ingress_started(self) -> bool:
+        return self._inbound_event_state.root().command_started
+
+    @_authorized_command_ingress_started.setter
+    def _authorized_command_ingress_started(self, value: bool) -> None:
+        self._inbound_event_state.root().command_started = bool(value)
+
+    @property
+    def _authorized_command_ingress_result(self) -> Any:
+        return self._inbound_event_state.root().command_result
+
+    @_authorized_command_ingress_result.setter
+    def _authorized_command_ingress_result(self, result: Any) -> None:
+        state = self._inbound_event_state.root()
+        state.command_started = True
+        state.command_result = result
+        future = state.command_future
+        if future is not None and not future.done():
+            future.set_result(result)
+
+    def _begin_authorized_command_ingress(self, future: Any) -> tuple[bool, Any]:
+        state = self._inbound_event_state.root()
+        if state.command_result is not None or state.command_started:
+            return False, state.command_future
+        state.command_started = True
+        state.command_future = future
+        return True, future
+
+    def _claim_authorized_command_response_delivery(self) -> bool:
+        state = self._inbound_event_state.root()
+        if state.response_delivery_started:
+            return False
+        state.response_delivery_started = True
+        return True
 
     def _command_text(self) -> str:
         """Return the message text with leading Desktop attachment refs stripped.

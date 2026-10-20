@@ -14,6 +14,7 @@ from enum import Enum
 
 from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from gateway.authorized_command_ingress import AuthorizedCommandIngressConfig
 from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
@@ -637,6 +638,11 @@ class GatewayConfig:
     on_all_adapters_down: str = "exit"  # "exit" | "stay_alive"; GATEWAY_ON_ALL_ADAPTERS_DOWN overrides
     unauthorized_dm_behavior: str = "pair"  # UNAUTHORIZED_DM_BEHAVIORS
     unauthorized_dm_decline_message: str = ""  # "decline" reply text; empty → DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
+    # Explicit post-authorization reserved-command boundary. Disabled by default;
+    # handlers are never discovered or installed implicitly.
+    authorized_command_ingress: AuthorizedCommandIngressConfig = field(
+        default_factory=AuthorizedCommandIngressConfig
+    )
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
@@ -655,6 +661,10 @@ class GatewayConfig:
 
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
+        if not isinstance(self.authorized_command_ingress, AuthorizedCommandIngressConfig):
+            self.authorized_command_ingress = AuthorizedCommandIngressConfig.from_dict(
+                self.authorized_command_ingress
+            )
 
     def get_connected_platforms(self) -> List[Platform]:
         """Enabled + configured platforms, sorted by value so the rendered "Connected
@@ -711,6 +721,7 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
+            "authorized_command_ingress": self.authorized_command_ingress.to_dict(),
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -810,6 +821,9 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),
+            authorized_command_ingress=AuthorizedCommandIngressConfig.from_dict(
+                pick("authorized_command_ingress")
+            ),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),

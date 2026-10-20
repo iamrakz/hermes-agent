@@ -16,6 +16,14 @@ import os
 import time
 from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
+from gateway.authorized_command_ingress import (
+    _SuccessfulInboundAdmission,
+    _context_from_successful_admission,
+)
+from gateway.authorized_command_ingress_routing import (
+    contain_busy_internal_authorized_command,
+    route_busy_authorized_command,
+)
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -501,6 +509,15 @@ class GatewayBusySessionMixin:
             metadata=self._thread_metadata_for_source(event.source, reply_anchor),
         )
 
+    async def _send_authorized_command_reply(self, event: MessageEvent, adapter, content: str) -> None:
+        """Deliver a reserved-command response with exactly one Telegram API attempt."""
+        from plugins.platforms.telegram.authorized_command_delivery import send_authorized_command_response_once
+        reply_anchor = self._reply_anchor_for_event(event)
+        await send_authorized_command_response_once(
+            adapter, chat_id=event.source.chat_id, content=content,
+            reply_to=self._busy_reply_to(event, reply_anchor),
+            metadata=self._thread_metadata_for_source(event.source, reply_anchor))
+
     async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
         """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
         adapter = self._delivery_adapter_for(event.source)
@@ -805,6 +822,10 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        if contain_busy_internal_authorized_command(self, event):
+            event._gateway_accepted = True
+            return True
+
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:
@@ -830,6 +851,14 @@ class GatewayBusySessionMixin:
         if not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
+
+        admission = object.__new__(_SuccessfulInboundAdmission)
+        object.__setattr__(
+            admission, "_SuccessfulInboundAdmission__event", event
+        )
+        context = _context_from_successful_admission(admission)
+        if await route_busy_authorized_command(self, context):
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping

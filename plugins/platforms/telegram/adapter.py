@@ -177,6 +177,7 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from plugins.platforms.telegram.authorized_command_evidence import attach_telegram_transport_evidence
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
@@ -6723,9 +6724,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
+        existing.absorb_reply_expected(event)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
-
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
         if self._should_drop_delayed_delivery():
@@ -7169,8 +7170,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return reply_to_id, reply_to_text
 
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
-        """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
-        triggering offset so the new gateway process advances past it."""
+        """Build an event; ``update_id`` lets a restart advance past the triggering offset."""
         chat = message.chat
         user = message.from_user
         telegram_chat_type = self._chat_type_str(chat)  # str() so PTB enums and plain-string mocks both work
@@ -7201,12 +7201,12 @@ class TelegramAdapter(BasePlatformAdapter):
         from plugins.platforms.telegram.telegram_context import group_identity_prompt
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
-        return MessageEvent(
+        return attach_telegram_transport_evidence(MessageEvent(
             text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
-            timestamp=message.date)
+            timestamp=message.date), message, update_id)
 
     # -- Message reactions (processing lifecycle) --
 
